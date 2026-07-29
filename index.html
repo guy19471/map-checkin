@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>全球地图打卡 - 记录你的旅行足迹</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🌍</text></svg>">
+  
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- ==================== 地图打卡页 ==================== -->
+    <div class="view active" id="view-map">
+      <div id="map"></div>
+      
+      <!-- 顶部搜索栏 -->
+      <div class="map-top-bar">
+        <div class="search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input type="text" id="search-input" placeholder="搜索城市或地区..." autocomplete="off">
+          <button id="search-clear" class="search-clear" style="display:none;">&times;</button>
+        </div>
+        <div class="search-results" id="search-results" style="display:none;"></div>
+      </div>
+
+      <!-- 主题切换按钮 -->
+      <button class="theme-toggle" id="theme-toggle" title="切换主题">
+        <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+
+      <!-- 横竖屏切换按钮 -->
+      <button class="orientation-toggle" id="orientation-toggle" data-mode="auto" title="切换横竖屏">
+        <svg class="icon-auto" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="7" y="2" width="10" height="20" rx="2"/>
+          <path d="M12 6v2M10 7h4"/>
+          <path d="M2 12h2M20 12h2" stroke-linecap="round"/>
+        </svg>
+        <svg class="icon-portrait" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="7" y="2" width="10" height="20" rx="2"/>
+          <path d="M11 18h2"/>
+        </svg>
+        <svg class="icon-landscape" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <rect x="2" y="7" width="20" height="10" rx="2"/>
+          <path d="M18 11v2"/>
+        </svg>
+      </button>
+
+      <!-- 统计浮窗 -->
+      <div class="map-stats" id="map-stats">
+        <div class="stat-item">
+          <span class="stat-value" id="stat-checkins">0</span>
+          <span class="stat-label">已打卡</span>
+        </div>
+        <div class="stat-divider"></div>
+        <div class="stat-item">
+          <span class="stat-value" id="stat-regions">972</span>
+          <span class="stat-label">可打卡区</span>
+        </div>
+      </div>
+
+      <!-- 打卡确认弹窗 -->
+      <div class="checkin-modal" id="checkin-modal">
+        <div class="checkin-modal-content">
+          <div class="checkin-modal-icon">📍</div>
+          <h2 class="checkin-modal-title" id="checkin-region-name">--</h2>
+          <p class="checkin-modal-subtitle" id="checkin-region-info">--</p>
+          <div class="checkin-modal-coords" id="checkin-coords">--</div>
+          <p class="checkin-modal-boundary-hint">黄色虚线区域为识别到的行政区划范围</p>
+          <div class="checkin-modal-actions">
+            <button class="btn-cancel" id="checkin-cancel">取消</button>
+            <button class="btn-confirm" id="checkin-confirm">
+              <span>确认打卡</span>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M20 6L9 17l-5-5"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 打卡成功动画 -->
+      <div class="checkin-success" id="checkin-success">
+        <div class="success-ring"></div>
+        <div class="success-icon">✓</div>
+        <div class="success-text">打卡成功！</div>
+      </div>
+
+      <!-- 提示信息 -->
+      <div class="map-hint" id="map-hint">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>
+        </svg>
+        <span>双击地图任意位置完成打卡</span>
+      </div>
+    </div>
+
+    <!-- ==================== 城市清单页 ==================== -->
+    <div class="view" id="view-checklist">
+      <div class="page-header">
+        <h1>打卡</h1>
+        <p>勾选你去过的城市和地区</p>
+      </div>
+
+      <!-- 清单统计 -->
+      <div class="checklist-stats" id="checklist-stats">
+        <div class="checklist-stat-bar">
+          <div class="checklist-stat-fill" id="checklist-progress-fill"></div>
+        </div>
+        <div class="checklist-stat-text">
+          已打卡 <span id="checklist-checked-count">0</span> / <span id="checklist-total-count">972</span>
+        </div>
+      </div>
+
+      <!-- 搜索过滤 -->
+      <div class="checklist-search-bar">
+        <div class="search-box checklist-search-box">
+          <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input type="text" id="checklist-search" placeholder="搜索城市..." autocomplete="off">
+          <button id="checklist-search-clear" class="search-clear" style="display:none;">&times;</button>
+        </div>
+      </div>
+
+      <!-- 筛选标签 -->
+      <div class="checklist-filters">
+        <button class="filter-chip active" data-filter="all">全部</button>
+        <button class="filter-chip" data-filter="checked">已去</button>
+        <button class="filter-chip" data-filter="unchecked">未去</button>
+      </div>
+
+      <!-- 层级树列表 -->
+      <div class="checklist-tree" id="checklist-tree">
+        <div class="loading-spinner">
+          <div class="spinner"></div>
+          <p>加载城市清单中...</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- ==================== 排行榜页 ==================== -->
+    <div class="view" id="view-leaderboard">
+      <div class="page-header">
+        <h1>全球排行榜</h1>
+        <p>与全世界的旅行者一较高下</p>
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="stats-grid" id="global-stats">
+        <div class="stat-card">
+          <div class="stat-card-icon">👥</div>
+          <div class="stat-card-value" id="lb-total-users">0</div>
+          <div class="stat-card-label">参与人数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-icon">📍</div>
+          <div class="stat-card-value" id="lb-total-checkins">0</div>
+          <div class="stat-card-label">总打卡数</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-card-icon">🗺️</div>
+          <div class="stat-card-value" id="lb-unique-regions">0</div>
+          <div class="stat-card-label">覆盖区域</div>
+        </div>
+      </div>
+
+      <!-- 我的排名 -->
+      <div class="my-rank-card" id="my-rank-card">
+        <div class="my-rank-badge" id="my-rank-num">--</div>
+        <div class="my-rank-info">
+          <div class="my-rank-name" id="my-rank-name">--</div>
+          <div class="my-rank-detail">
+            <span id="my-rank-checkins">0</span> 个打卡 · 
+            击败 <span id="my-rank-percentile">0</span>% 的用户
+          </div>
+        </div>
+      </div>
+
+      <!-- 排行榜列表 -->
+      <div class="leaderboard-list" id="leaderboard-list">
+        <div class="loading-spinner">
+          <div class="spinner"></div>
+          <p>加载排行榜中...</p>
+        </div>
+      </div>
+
+      <!-- 热门区域 -->
+      <div class="section-title">
+        <h2>🔥 热门打卡区域</h2>
+      </div>
+      <div class="hot-regions" id="hot-regions"></div>
+    </div>
+
+    <!-- ==================== 个人中心页 ==================== -->
+    <div class="view" id="view-profile">
+      <div class="profile-header">
+        <div class="profile-avatar" id="profile-avatar">🌍</div>
+        <div class="profile-name" id="profile-name">旅行者</div>
+        <div class="profile-stats">
+          <div class="profile-stat">
+            <span class="profile-stat-value" id="profile-checkins">0</span>
+            <span class="profile-stat-label">打卡</span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-value" id="profile-countries">0</span>
+            <span class="profile-stat-label">国家</span>
+          </div>
+          <div class="profile-stat">
+            <span class="profile-stat-value" id="profile-rank">--</span>
+            <span class="profile-stat-label">排名</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 打卡进度 -->
+      <div class="progress-section">
+        <div class="progress-header">
+          <span>全球探索进度</span>
+          <span id="progress-text">0 / 972</span>
+        </div>
+        <div class="progress-bar">
+          <div class="progress-fill" id="progress-fill" style="width: 0%"></div>
+        </div>
+      </div>
+
+      <!-- 打卡记录 -->
+      <div class="section-title">
+        <h2>我的足迹</h2>
+      </div>
+      <div class="checkin-list" id="checkin-list">
+        <div class="empty-state">
+          <div class="empty-icon">🗺️</div>
+          <p>还没有打卡记录</p>
+          <p class="empty-hint">去地图上双击打卡吧！</p>
+        </div>
+      </div>
+
+      <!-- 设置 -->
+      <div class="settings-section">
+        <button class="settings-btn" id="edit-name-btn">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+            <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+          </svg>
+          <span>修改昵称</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ==================== 底部导航 ==================== -->
+    <nav class="bottom-nav">
+      <button class="nav-item active" data-view="map">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/>
+          <line x1="8" y1="2" x2="8" y2="18"/>
+          <line x1="16" y1="6" x2="16" y2="22"/>
+        </svg>
+        <span>地图</span>
+      </button>
+      <button class="nav-item" data-view="checklist">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M9 11l3 3L22 4"/>
+          <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>
+        </svg>
+        <span>打卡</span>
+      </button>
+      <button class="nav-item" data-view="leaderboard">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/>
+          <path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/>
+          <path d="M4 22h16"/>
+          <path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/>
+          <path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/>
+          <path d="M18 2H6v7a6 6 0 0 0 12 0V2Z"/>
+        </svg>
+        <span>排行榜</span>
+      </button>
+      <button class="nav-item" data-view="profile">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+        <span>我的</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- 编辑昵称弹窗 -->
+  <div class="modal-overlay" id="name-modal">
+    <div class="modal-card">
+      <h3>修改昵称</h3>
+      <input type="text" id="name-input" maxlength="20" placeholder="输入新昵称">
+      <div class="modal-actions">
+        <button class="btn-cancel" id="name-cancel">取消</button>
+        <button class="btn-confirm" id="name-save">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast 提示 -->
+  <div class="toast" id="toast"></div>
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

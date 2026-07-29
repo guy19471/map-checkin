@@ -360,7 +360,7 @@ async function ensureLogin() {
 async function loadRegions() {
   if (state.regionsCache) return state.regionsCache;
   try {
-    const resp = await fetch('regions.json');
+    const resp = await fetch('regions.json?v=20260729a');
     if (resp.ok) {
       const data = await resp.json();
       state.regionsCache = data.regions;
@@ -517,6 +517,23 @@ function setCachedBoundary(code, polygons) {
   } catch (e) {}
 }
 
+// 带超时的 fetch (默认 8s, 避免 DataV 挂起时永久等待)
+async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      throw new Error(`Request timeout after ${timeoutMs}ms`);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchBoundary(code) {
   // 1. 检查缓存
   const cached = getCachedBoundary(code);
@@ -528,7 +545,11 @@ async function fetchBoundary(code) {
   if (code.startsWith('CN-')) {
     const adcode = code.replace('CN-', '');
     try {
-      const resp = await fetch(`https://geo.datav.aliyun.com/areas_v3/bound/${adcode}.json`);
+      const resp = await fetchWithTimeout(
+        `https://geo.datav.aliyun.com/areas_v3/bound/${adcode}.json`,
+        {},
+        8000
+      );
       if (resp.ok) {
         const geojson = await resp.json();
         if (geojson.features && geojson.features.length > 0) {
@@ -552,8 +573,8 @@ async function fetchBoundary(code) {
     } catch (e) {
       console.warn(`DataV fetch failed for ${code}:`, e.message);
     }
-    // 中国城市 DataV 失败时不回退到圆形, 返回失败
-    return { success: false, polygons: [] };
+    // 中国城市 DataV 失败时: 用小圆圈作 fallback (不缓存, 便于下次重试)
+    return buildFallbackCircle(code, 0.3); // 约 30km
   }
 
   // 3. 国外区域: 用 Nominatim API 获取真实行政边界
@@ -565,9 +586,10 @@ async function fetchBoundary(code) {
     const searchCountry = region.countryEn || region.country;
     try {
       const query = encodeURIComponent(searchName + ', ' + searchCountry);
-      const resp = await fetch(
+      const resp = await fetchWithTimeout(
         `https://nominatim.openstreetmap.org/search?q=${query}&format=geojson&polygon_geojson=1&limit=1&accept-language=en`,
-        { headers: { 'Accept': 'application/json' } }
+        { headers: { 'Accept': 'application/json' } },
+        8000
       );
       if (resp.ok) {
         const data = await resp.json();
@@ -584,20 +606,27 @@ async function fetchBoundary(code) {
       console.warn(`Nominatim fetch failed for ${code}:`, e.message);
     }
 
-    // Nominatim 失败时回退: 用更大的虚线圆标识 (比之前的小圆点更明显)
-    const radius = 1.5; // 约150km
-    const points = [];
-    for (let i = 0; i <= 64; i++) {
-      const angle = (i / 64) * 2 * Math.PI;
-      points.push([
-        region.lat + radius * Math.sin(angle),
-        region.lng + radius * Math.cos(angle) / Math.cos(region.lat * Math.PI / 180)
-      ]);
-    }
-    return { success: true, code, polygons: [points], isCircle: true };
+    // Nominatim 失败时回退: 150km 圆 (不缓存, 便于下次重试)
+    return buildFallbackCircle(code, 1.5);
   }
 
   return { success: false, polygons: [] };
+}
+
+// 通用圆形 fallback (不写入缓存, 下次会重新尝试 API)
+async function buildFallbackCircle(code, radius) {
+  const regions = await loadRegions();
+  const region = regions.find(r => r.code === code);
+  if (!region) return { success: false, polygons: [] };
+  const points = [];
+  for (let i = 0; i <= 64; i++) {
+    const angle = (i / 64) * 2 * Math.PI;
+    points.push([
+      region.lat + radius * Math.sin(angle),
+      region.lng + radius * Math.cos(angle) / Math.cos(region.lat * Math.PI / 180)
+    ]);
+  }
+  return { success: true, code, polygons: [points], isCircle: true };
 }
 
 // 从 GeoJSON geometry 提取多边形 (支持 Polygon / MultiPolygon)
@@ -786,26 +815,42 @@ async function loadCheckedMarkers() {
 
   const checkins = getLocalCheckins();
 
-  for (const r of checkins) {
-    try {
-      const boundaryData = await fetchBoundary(r.region_code);
-      if (boundaryData.success && boundaryData.polygons) {
-        boundaryData.polygons.forEach(polygon => {
-          if (polygon.length >= 3) {
-            const poly = L.polygon(polygon, {
-              color: '#10b981', weight: 2, opacity: 0.7,
-              fillColor: '#10b981', fillOpacity: 0.12,
-              className: 'checked-boundary'
-            }).addTo(state.map);
-            poly.bindPopup(`<b>${escapeHtml(r.region_name)}</b><br>已打卡`, { className: 'checkin-popup' });
-            state.boundaryLayers.push(poly);
-          }
-        });
-      }
-    } catch (e) {
-      console.warn(`Failed to load boundary for ${r.region_code}:`, e);
+  // 并行加载所有城市边界 (一个慢不影响其他)
+  // 单个失败用 Promise.allSettled 隔离, 不影响其他
+  const settled = await Promise.allSettled(
+    checkins.map(r => fetchBoundary(r.region_code))
+  );
+
+  settled.forEach((result, idx) => {
+    const r = checkins[idx];
+    if (result.status !== 'fulfilled') {
+      console.warn(`Boundary load failed for ${r.region_code}:`, result.reason);
+      return;
     }
-  }
+    const boundaryData = result.value;
+    if (!boundaryData.success || !boundaryData.polygons) return;
+
+    // 失败 fallback 的小圆圈用浅黄色虚线 (区别于已打卡的绿色实线)
+    const isFallback = !!boundaryData.isCircle;
+    const style = isFallback ? {
+      color: '#f59e0b', weight: 1.5, opacity: 0.6,
+      fillColor: '#fbbf24', fillOpacity: 0.08,
+      dashArray: '6, 4', className: 'pending-boundary'
+    } : {
+      color: '#10b981', weight: 2, opacity: 0.7,
+      fillColor: '#10b981', fillOpacity: 0.12,
+      className: 'checked-boundary'
+    };
+
+    boundaryData.polygons.forEach(polygon => {
+      if (polygon.length >= 3) {
+        const poly = L.polygon(polygon, style).addTo(state.map);
+        const note = isFallback ? ' (边界暂未加载)' : '';
+        poly.bindPopup(`<b>${escapeHtml(r.region_name)}</b><br>已打卡${note}`, { className: 'checkin-popup' });
+        state.boundaryLayers.push(poly);
+      }
+    });
+  });
 
   updateMapStats(checkins.length);
 }

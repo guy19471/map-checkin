@@ -475,18 +475,45 @@ function isPointInPolygon(lng, lat, polygon) {
 
 // ==================== 区域边界获取 ====================
 
+// 边界缓存版本号 - 升级时递增, 自动清空旧版缓存
+const BOUNDARY_CACHE_VERSION = 2;
+
+// 检查并清理旧版缓存 (无 isReal 标记的视为旧版/失败缓存)
+function migrateBoundaryCache() {
+  try {
+    const v = localStorage.getItem('mc_boundary_cache_version');
+    if (v !== String(BOUNDARY_CACHE_VERSION)) {
+      const keys = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith('mc_boundary_')) keys.push(k);
+      }
+      keys.forEach(k => localStorage.removeItem(k));
+      localStorage.setItem('mc_boundary_cache_version', String(BOUNDARY_CACHE_VERSION));
+      console.log(`[migrate] cleared ${keys.length} stale boundary cache entries (v${BOUNDARY_CACHE_VERSION})`);
+    }
+  } catch (e) {}
+}
+
 // 边界缓存 (localStorage, 避免重复请求 API)
+// 只缓存真实边界 (isReal=true), 圆形回退永远不缓存
 function getCachedBoundary(code) {
   try {
-    const cached = localStorage.getItem('mc_boundary_' + code);
-    if (cached) return JSON.parse(cached);
+    const cached = JSON.parse(localStorage.getItem('mc_boundary_' + code));
+    if (cached && cached.isReal === true && cached.polygons && cached.polygons.length > 0) {
+      return cached;
+    }
   } catch (e) {}
   return null;
 }
 
 function setCachedBoundary(code, polygons) {
   try {
-    localStorage.setItem('mc_boundary_' + code, JSON.stringify({ polygons, ts: Date.now() }));
+    localStorage.setItem('mc_boundary_' + code, JSON.stringify({
+      polygons,
+      isReal: true,
+      ts: Date.now()
+    }));
   } catch (e) {}
 }
 
@@ -1316,6 +1343,9 @@ function switchView(viewName) {
 
 // ==================== 初始化 ====================
 async function init() {
+  // 启动时清理旧版边界缓存 (无 isReal 标记 = 旧版/失败数据)
+  migrateBoundaryCache();
+
   initTheme();
   initOrientation();
   initMap();

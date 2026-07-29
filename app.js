@@ -474,8 +474,30 @@ function isPointInPolygon(lng, lat, polygon) {
 }
 
 // ==================== 区域边界获取 ====================
+
+// 边界缓存 (localStorage, 避免重复请求 API)
+function getCachedBoundary(code) {
+  try {
+    const cached = localStorage.getItem('mc_boundary_' + code);
+    if (cached) return JSON.parse(cached);
+  } catch (e) {}
+  return null;
+}
+
+function setCachedBoundary(code, polygons) {
+  try {
+    localStorage.setItem('mc_boundary_' + code, JSON.stringify({ polygons, ts: Date.now() }));
+  } catch (e) {}
+}
+
 async function fetchBoundary(code) {
-  // 中国城市: 从 DataV API 获取真实边界
+  // 1. 检查缓存
+  const cached = getCachedBoundary(code);
+  if (cached && cached.polygons && cached.polygons.length > 0) {
+    return { success: true, code, polygons: cached.polygons, fromCache: true };
+  }
+
+  // 2. 中国城市: 从 DataV API 获取真实边界
   if (code.startsWith('CN-')) {
     const adcode = code.replace('CN-', '');
     try {
@@ -489,34 +511,80 @@ async function fetchBoundary(code) {
             if (geom.type === 'Polygon') {
               polygons.push(convertGeoJsonRing(geom.coordinates));
             } else if (geom.type === 'MultiPolygon') {
-              geom.coordinates.forEach(poly => polygons.push(convertGeoJsonRing(poly)));
+              geom.coordinates.forEach(poly => {
+                if (poly && poly[0]) polygons.push(convertGeoJsonRing(poly));
+              });
             }
           });
-          if (polygons.length > 0) return { success: true, code, polygons };
+          if (polygons.length > 0) {
+            setCachedBoundary(code, polygons);
+            return { success: true, code, polygons };
+          }
         }
       }
     } catch (e) {
       console.warn(`DataV fetch failed for ${code}:`, e.message);
     }
+    // 中国城市 DataV 失败时不回退到圆形, 返回失败
+    return { success: false, polygons: [] };
   }
 
-  // 国外区域: 生成圆形边界 (基于中心点)
+  // 3. 国外区域: 用 Nominatim API 获取真实行政边界
   const regions = await loadRegions();
   const region = regions.find(r => r.code === code);
   if (region) {
-    const radius = 0.5; // 约50km
+    // 使用英文名查询 Nominatim (更准确)
+    const searchName = region.nameEn || region.name;
+    const searchCountry = region.countryEn || region.country;
+    try {
+      const query = encodeURIComponent(searchName + ', ' + searchCountry);
+      const resp = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${query}&format=geojson&polygon_geojson=1&limit=1&accept-language=en`,
+        { headers: { 'Accept': 'application/json' } }
+      );
+      if (resp.ok) {
+        const data = await resp.json();
+        if (data.features && data.features.length > 0) {
+          const geom = data.features[0].geometry;
+          const polygons = extractGeometryPolygons(geom);
+          if (polygons.length > 0) {
+            setCachedBoundary(code, polygons);
+            return { success: true, code, polygons };
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`Nominatim fetch failed for ${code}:`, e.message);
+    }
+
+    // Nominatim 失败时回退: 用更大的虚线圆标识 (比之前的小圆点更明显)
+    const radius = 1.5; // 约150km
     const points = [];
-    for (let i = 0; i <= 32; i++) {
-      const angle = (i / 32) * 2 * Math.PI;
+    for (let i = 0; i <= 64; i++) {
+      const angle = (i / 64) * 2 * Math.PI;
       points.push([
         region.lat + radius * Math.sin(angle),
         region.lng + radius * Math.cos(angle) / Math.cos(region.lat * Math.PI / 180)
       ]);
     }
-    return { success: true, code, polygons: [points] };
+    return { success: true, code, polygons: [points], isCircle: true };
   }
 
   return { success: false, polygons: [] };
+}
+
+// 从 GeoJSON geometry 提取多边形 (支持 Polygon / MultiPolygon)
+function extractGeometryPolygons(geom) {
+  const polygons = [];
+  if (!geom) return polygons;
+  if (geom.type === 'Polygon') {
+    polygons.push(convertGeoJsonRing(geom.coordinates));
+  } else if (geom.type === 'MultiPolygon') {
+    geom.coordinates.forEach(poly => {
+      if (poly && poly[0]) polygons.push(convertGeoJsonRing(poly));
+    });
+  }
+  return polygons;
 }
 
 function convertGeoJsonRing(coordinates) {

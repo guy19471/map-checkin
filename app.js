@@ -476,7 +476,7 @@ function isPointInPolygon(lng, lat, polygon) {
 // ==================== 区域边界获取 ====================
 
 // 边界缓存版本号 - 升级时递增, 自动清空旧版缓存
-const BOUNDARY_CACHE_VERSION = 2;
+const BOUNDARY_CACHE_VERSION = 3;
 
 // 检查并清理旧版缓存 (无 isReal 标记的视为旧版/失败缓存)
 function migrateBoundaryCache() {
@@ -496,12 +496,15 @@ function migrateBoundaryCache() {
 }
 
 // 边界缓存 (localStorage, 避免重复请求 API)
-// 只缓存真实边界 (isReal=true), 圆形回退永远不缓存
+// 真实边界 (isReal=true) 优先, fallback 圆 (isFallback=true) 兜底
+// 两个都打标, getCachedBoundary 只信任带标记的
 function getCachedBoundary(code) {
   try {
     const cached = JSON.parse(localStorage.getItem('mc_boundary_' + code));
-    if (cached && cached.isReal === true && cached.polygons && cached.polygons.length > 0) {
-      return cached;
+    if (cached && cached.polygons && cached.polygons.length > 0) {
+      if (cached.isReal === true || cached.isFallback === true) {
+        return cached;
+      }
     }
   } catch (e) {}
   return null;
@@ -517,8 +520,19 @@ function setCachedBoundary(code, polygons) {
   } catch (e) {}
 }
 
-// 带超时的 fetch (默认 8s, 避免 DataV 挂起时永久等待)
-async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
+function setFallbackBoundaryCache(code, polygons) {
+  try {
+    localStorage.setItem('mc_boundary_' + code, JSON.stringify({
+      polygons,
+      isFallback: true,
+      isCircle: true,
+      ts: Date.now()
+    }));
+  } catch (e) {}
+}
+
+// 带超时的 fetch (默认 15s, 避免 DataV 挂起时永久等待)
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -534,21 +548,53 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8000) {
   }
 }
 
-async function fetchBoundary(code) {
-  // 1. 检查缓存
-  const cached = getCachedBoundary(code);
-  if (cached && cached.polygons && cached.polygons.length > 0) {
-    return { success: true, code, polygons: cached.polygons, fromCache: true };
+// 通用 fetch + 自动重试 (DataV API 偶发 000 连接失败/超时, 最多 3 次)
+async function fetchWithRetry(url, options = {}, timeoutMs = 15000, retries = 3) {
+  let lastErr = null;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const resp = await fetchWithTimeout(url, options, timeoutMs);
+      if (resp.ok) return resp;
+      lastErr = new Error(`HTTP ${resp.status}`);
+      // 5xx / 403 才有重试意义, 404 直接放弃
+      if (resp.status === 404) return resp;
+    } catch (e) {
+      lastErr = e;
+      console.warn(`[fetchWithRetry] ${url} attempt ${i + 1}/${retries} failed: ${e.message}`);
+    }
+    if (i < retries - 1) {
+      // 退避: 1s, 2s
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  throw lastErr || new Error('All retries failed');
+}
+
+async function fetchBoundary(code, forceRefresh = false) {
+  // 1. 检查缓存 (除非 forceRefresh)
+  if (!forceRefresh) {
+    const cached = getCachedBoundary(code);
+    if (cached && cached.polygons && cached.polygons.length > 0) {
+      return {
+        success: true,
+        code,
+        polygons: cached.polygons,
+        fromCache: true,
+        isReal: cached.isReal === true,
+        isCircle: cached.isFallback === true || cached.isCircle === true
+      };
+    }
   }
 
-  // 2. 中国城市: 从 DataV API 获取真实边界
+  // 2. 中国城市: 从 DataV API 获取真实边界 (3 次重试 + 15s 超时)
   if (code.startsWith('CN-')) {
     const adcode = code.replace('CN-', '');
     try {
-      const resp = await fetchWithTimeout(
+      const resp = await fetchWithRetry(
         `https://geo.datav.aliyun.com/areas_v3/bound/${adcode}.json`,
         {},
-        8000
+        15000,
+        3
       );
       if (resp.ok) {
         const geojson = await resp.json();
@@ -571,9 +617,9 @@ async function fetchBoundary(code) {
         }
       }
     } catch (e) {
-      console.warn(`DataV fetch failed for ${code}:`, e.message);
+      console.warn(`DataV fetch failed for ${code} (after retries):`, e.message);
     }
-    // 中国城市 DataV 失败时: 用小圆圈作 fallback (不缓存, 便于下次重试)
+    // 中国城市 DataV 失败时: 用小圆圈作 fallback, 缓存避免反复请求
     return buildFallbackCircle(code, 0.3); // 约 30km
   }
 
@@ -586,10 +632,11 @@ async function fetchBoundary(code) {
     const searchCountry = region.countryEn || region.country;
     try {
       const query = encodeURIComponent(searchName + ', ' + searchCountry);
-      const resp = await fetchWithTimeout(
+      const resp = await fetchWithRetry(
         `https://nominatim.openstreetmap.org/search?q=${query}&format=geojson&polygon_geojson=1&limit=1&accept-language=en`,
         { headers: { 'Accept': 'application/json' } },
-        8000
+        15000,
+        2
       );
       if (resp.ok) {
         const data = await resp.json();
@@ -603,17 +650,17 @@ async function fetchBoundary(code) {
         }
       }
     } catch (e) {
-      console.warn(`Nominatim fetch failed for ${code}:`, e.message);
+      console.warn(`Nominatim fetch failed for ${code} (after retries):`, e.message);
     }
 
-    // Nominatim 失败时回退: 150km 圆 (不缓存, 便于下次重试)
+    // Nominatim 失败时回退: 150km 圆 (缓存以避免反复请求)
     return buildFallbackCircle(code, 1.5);
   }
 
   return { success: false, polygons: [] };
 }
 
-// 通用圆形 fallback (不写入缓存, 下次会重新尝试 API)
+// 通用圆形 fallback (写入缓存, 避免每次刷新都重新请求不稳定的 API)
 async function buildFallbackCircle(code, radius) {
   const regions = await loadRegions();
   const region = regions.find(r => r.code === code);
@@ -626,7 +673,9 @@ async function buildFallbackCircle(code, radius) {
       region.lng + radius * Math.cos(angle) / Math.cos(region.lat * Math.PI / 180)
     ]);
   }
-  return { success: true, code, polygons: [points], isCircle: true };
+  const polygons = [points];
+  setFallbackBoundaryCache(code, polygons);
+  return { success: true, code, polygons, isCircle: true };
 }
 
 // 从 GeoJSON geometry 提取多边形 (支持 Polygon / MultiPolygon)
@@ -804,7 +853,7 @@ function showSuccessAnimation() {
 }
 
 // ==================== 地图标记 ====================
-async function loadCheckedMarkers() {
+async function loadCheckedMarkers(forceRefresh = false) {
   if (!state.user) return;
 
   // 清除旧边界
@@ -818,7 +867,7 @@ async function loadCheckedMarkers() {
   // 并行加载所有城市边界 (一个慢不影响其他)
   // 单个失败用 Promise.allSettled 隔离, 不影响其他
   const settled = await Promise.allSettled(
-    checkins.map(r => fetchBoundary(r.region_code))
+    checkins.map(r => fetchBoundary(r.region_code, forceRefresh))
   );
 
   settled.forEach((result, idx) => {
@@ -833,8 +882,8 @@ async function loadCheckedMarkers() {
     // 失败 fallback 的小圆圈用浅黄色虚线 (区别于已打卡的绿色实线)
     const isFallback = !!boundaryData.isCircle;
     const style = isFallback ? {
-      color: '#f59e0b', weight: 1.5, opacity: 0.6,
-      fillColor: '#fbbf24', fillOpacity: 0.08,
+      color: '#f59e0b', weight: 1.5, opacity: 0.7,
+      fillColor: '#fbbf24', fillOpacity: 0.10,
       dashArray: '6, 4', className: 'pending-boundary'
     } : {
       color: '#10b981', weight: 2, opacity: 0.7,
@@ -845,8 +894,13 @@ async function loadCheckedMarkers() {
     boundaryData.polygons.forEach(polygon => {
       if (polygon.length >= 3) {
         const poly = L.polygon(polygon, style).addTo(state.map);
-        const note = isFallback ? ' (边界暂未加载)' : '';
-        poly.bindPopup(`<b>${escapeHtml(r.region_name)}</b><br>已打卡${note}`, { className: 'checkin-popup' });
+        if (isFallback) {
+          // Fallback 圆: 加"重试"按钮
+          const retryBtn = `<br><a href="#" onclick="retryBoundary('${r.region_code}'); return false;" style="color:#3b82f6; text-decoration:underline;">↻ 重新加载真实边界</a>`;
+          poly.bindPopup(`<b>${escapeHtml(r.region_name)}</b><br>已打卡 (边界暂未加载)${retryBtn}`, { className: 'checkin-popup' });
+        } else {
+          poly.bindPopup(`<b>${escapeHtml(r.region_name)}</b><br>已打卡`, { className: 'checkin-popup' });
+        }
         state.boundaryLayers.push(poly);
       }
     });
@@ -854,6 +908,17 @@ async function loadCheckedMarkers() {
 
   updateMapStats(checkins.length);
 }
+
+// 用户点 popup 的"重试"按钮, 强制重新 fetch 单个城市的边界
+window.retryBoundary = async function(code) {
+  state.map.closePopup();
+  showToast('正在重新加载边界...', '');
+  // 强制清掉该城市的缓存
+  try { localStorage.removeItem('mc_boundary_' + code); } catch (e) {}
+  // 重新加载所有边界 (forceRefresh=true 会跳过缓存, 重新 fetch)
+  await loadCheckedMarkers(true);
+  showToast('已重新加载', 'success');
+};
 
 function updateMapStats(count) {
   const checkinCount = count !== undefined ? count : (state.user ? state.user.totalCheckins : 0);
